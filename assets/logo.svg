@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <!-- Background Squircle Badge -->
+  <rect width="512" height="512" rx="128" fill="#0E1017" />
+  <rect x="8" y="8" width="496" height="496" rx="120" fill="none" stroke="#1A1E29" stroke-width="6" />
+
+  <!-- Geometric Minimalist 'D' + 3-Bar Soundwave -->
+  <g transform="translate(48, 48)">
+    <!-- Bold Letter 'D' Outer Outline -->
+    <path
+      d="M 104 80 
+         H 232 
+         C 310 80, 368 138, 368 208 
+         C 368 278, 310 336, 232 336 
+         H 104 
+         Z"
+      fill="none"
+      stroke="#FFFFFF"
+      stroke-width="38"
+      stroke-linejoin="round"
+      stroke-linecap="round"
+    />
+
+    <!-- 3 Rounded Equalizer Soundwave Bars -->
+    <!-- Bar 1 (Left - 100px height) -->
+    <rect x="194" y="158" width="28" height="100" rx="14" fill="#5865F2" />
+
+    <!-- Bar 2 (Center - 160px height) -->
+    <rect x="238" y="128" width="28" height="160" rx="14" fill="#5865F2" />
+
+    <!-- Bar 3 (Right - 100px height) -->
+    <rect x="282" y="158" width="28" height="100" rx="14" fill="#5865F2" />
+  </g>
+</svg>
