@@ -2,11 +2,16 @@
 
 > **A Smart Discord Bot for Discovering, Managing, and Adding Sounds to Server Soundboards**
 
-[![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Project Status](https://img.shields.io/badge/status-active%20testing-orange.svg)]()
 [![Discord.py](https://img.shields.io/badge/discord.py-v2.5%2B-5865F2.svg)](https://discordpy.readthedocs.io/)
+[![Next.js](https://img.shields.io/badge/Next.js-14-black.svg)](https://nextjs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Dissound solves the tedious, multi-step hassle of expanding Discord Server Soundboards. Instead of having to leave Discord, search multiple meme websites, download audio clips, manually trim or convert them to Discord's strict audio limits, and upload them via server settings, Dissound provides an **integrated sound discovery, preview, and automated upload experience directly inside Discord**.
+> [!NOTE]
+> **Active Testing & Development Phase**  
+> Dissound is currently in its private testing and prototype phase. Public deployment and bot setup guides will be made available upon general release.
+
+Dissound solves the tedious, multi-step hassle of expanding Discord Server Soundboards. Instead of having to leave Discord, search multiple meme websites, download audio clips, manually trim or convert them to Discord's strict audio limits, and upload them via server settings, Dissound provides an **integrated sound discovery, preview, automated audio processing, and upload experience directly inside Discord and through a dedicated Web Dashboard**.
 
 ---
 
@@ -19,6 +24,7 @@ Dissound solves the tedious, multi-step hassle of expanding Discord Server Sound
 - 📤 **Custom Audio Upload**: Upload your own audio files via `/upload`; Dissound will auto-trim, optimize, and install them into your server soundboard.
 - 📊 **Soundboard Capacity & Status Tracking**: Run `/soundboard status` to monitor used/available slots according to your server's boost tier (Tier 0: 8 slots, Tier 1: 24 slots, Tier 2: 36 slots, Tier 3: 48 slots).
 - 📜 **Server Audit & Upload History**: Full audit trail via `/history` showing which members added which sounds, timestamps, and status.
+- 🌐 **Web Control Dashboard**: Dedicated Next.js web application with Discord OAuth2 + Mail OTP two-factor verification to manage soundboards from your browser.
 - ⚙️ **Customization Modal**: Fine-tune volume (0.1 to 1.0) and custom display names before installing.
 
 ---
@@ -26,11 +32,11 @@ Dissound solves the tedious, multi-step hassle of expanding Discord Server Sound
 ## 🏗️ System Architecture
 
 ```
-User in Discord Channel
+User in Discord / Web Dashboard
        │
-       ▼ (Slash Commands: /search, /preview, /add, /upload)
+       ▼ (Discord Slash Commands / Web OAuth Dashboard)
 ┌─────────────────────────────────────────────────────────────┐
-│                       Dissound Bot                          │
+│                    Dissound Platform                        │
 │                                                             │
 │   ┌────────────────────┐       ┌────────────────────────┐   │
 │   │   Discovery Cog    │       │     Soundboard Cog     │   │
@@ -48,72 +54,6 @@ User in Discord Channel
                               │     Discord REST API        │
                               │ (POST /guilds/../soundboard)│
                               └─────────────────────────────┘
-```
-
----
-
-## 🚀 Quick Start Guide
-
-### 1. Prerequisites
-- **Python 3.10+** (Tested on Python 3.10, 3.11, 3.12, 3.13, and 3.14)
-- **Git**
-
-### 2. Clone Repository & Setup Virtual Environment
-```bash
-git clone https://github.com/ligthningkrish/Dissound.git
-cd Dissound
-
-# Create and activate virtual environment
-python -m venv .venv
-
-# On Windows (PowerShell):
-.\.venv\Scripts\Activate.ps1
-
-# On Linux/macOS:
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 3. Create Discord Bot & Configure `.env`
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications).
-2. Click **New Application** and give it a name (e.g. `Dissound`).
-3. Navigate to the **Bot** tab on the left menu:
-   - Click **Reset Token** to copy your bot token.
-4. Copy `.env.example` to `.env`:
-   ```bash
-   cp .env.example .env   # On Windows: copy .env.example .env
-   ```
-5. Open `.env` and paste your bot token:
-   ```ini
-   DISCORD_TOKEN=your_token_here
-   # Optional: set your testing server ID for instant slash command registration:
-   DEV_GUILD_ID=123456789012345678
-   ```
-
-### 4. Bot Permissions & Invite Link
-Navigate to **OAuth2 ➔ URL Generator** in the Discord Developer Portal:
-- **Scopes**: `bot`, `applications.commands`
-- **Bot Permissions**:
-  - `Create Expressions` (Required to upload Soundboard sounds)
-  - `Manage Expressions` (Required to delete Soundboard sounds)
-  - `Send Messages`
-  - `Embed Links`
-  - `Attach Files` (Required to send audio preview clips)
-  - `Read Message History`
-
-Copy the generated URL and open it in your browser to invite Dissound to your server.
-
-### 5. Seed Initial Sound Library & Run
-Dissound comes bundled with synthesized starter meme sounds (Vine Boom, Metal Pipe, Windows XP Error, Airhorn, Roblox Oof, Bruh, Bonk, Among Us, and Anime Wow).
-
-```bash
-# Seed default meme catalog into the database
-python assets/seed_data.py
-
-# Start the bot
-python main.py
 ```
 
 ---
@@ -138,19 +78,9 @@ python main.py
 
 ---
 
-## 🧪 Testing
-
-Dissound includes a suite of unit and integration tests covering audio processing, Discord Soundboard limits, and database operations:
-
-```bash
-python -m unittest discover tests
-```
-
----
-
 ## 🗄️ Database Schema
 
-The database uses SQLite via asynchronous `aiosqlite` with the following schema:
+The system tracks sounds, servers, users, and upload logs with the following core entities:
 
 - **`sounds`**: `sound_id`, `sound_name`, `category`, `file_path`, `duration`, `file_size`, `file_format`, `source_url`, `tags`, `created_at`
 - **`servers`**: `server_id`, `server_name`, `sound_limit`, `created_at`
