@@ -40,3 +40,12 @@ data/cache/
 .idea/
 *.swp
 *.swo
+
+# Web Dashboard / Node / Next.js
+node_modules/
+.next/
+out/
+web/.env.local
+web/.env
+web/node_modules/
+web/.next/
