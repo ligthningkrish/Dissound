@@ -1,0 +1,8 @@
+{
+  "name": "Dissound - MemeSound Bot & Dashboard",
+  "description": "Smart Discord Bot & Web Dashboard for discovering, previewing, and managing meme sounds on server soundboards.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
