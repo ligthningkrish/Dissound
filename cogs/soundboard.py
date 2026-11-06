@@ -1,6 +1,6 @@
 """
 Discord Soundboard management cog for Dissound.
-Handles /add, /upload, /soundboard list, /soundboard status, and /soundboard delete.
+Handles /add, /upload, /soundboard list, /soundboard status, /soundboard delete, /soundboard manage, and /delete_sound.
 """
 from typing import List, Optional
 import discord
@@ -19,10 +19,17 @@ from database.models import Sound
 from database.repository import Repository
 from audio.processor import audio_processor
 from audio.downloader import AudioDownloader
-from ui.views import upload_sound_to_guild, SoundboardDeleteConfirmView
+from ui.views import (
+    upload_sound_to_guild,
+    SoundboardDeleteConfirmView,
+    SoundboardManageView,
+    verify_user_bot_access
+)
+from core.permissions import check_bot_access
 from core.logger import log
 
 repo = Repository()
+
 
 async def library_sound_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     """Autocomplete for adding sound from catalog."""
@@ -39,13 +46,56 @@ async def library_sound_autocomplete(interaction: discord.Interaction, current: 
         for s in sounds
     ][:25]
 
+
+async def guild_sound_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete for deleting active soundboard sounds currently installed in the guild."""
+    if not interaction.guild:
+        return []
+    try:
+        sounds = await interaction.guild.fetch_soundboard_sounds()
+    except Exception:
+        sounds = interaction.guild.soundboard_sounds
+
+    current_lower = current.strip().lower()
+    choices = []
+    for s in sounds:
+        if not current_lower or current_lower in s.name.lower():
+            emoji_prefix = f"{s.emoji} " if s.emoji else ""
+            label = f"{emoji_prefix}{s.name} (Vol: {s.volume})"[:100]
+            choices.append(app_commands.Choice(name=label, value=s.name))
+    return choices[:25]
+
+
+class SoundboardListActionView(discord.ui.View):
+    """Action bar attached to /soundboard list with a quick button to manage or delete sounds."""
+
+    def __init__(self, guild: discord.Guild, author_id: int):
+        super().__init__(timeout=180.0)
+        self.guild = guild
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await verify_user_bot_access(interaction)
+
+    @discord.ui.button(label="Manage / Delete Sounds", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def manage_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            sounds = await self.guild.fetch_soundboard_sounds()
+        except Exception:
+            sounds = self.guild.soundboard_sounds
+
+        manage_view = SoundboardManageView(guild=self.guild, author_id=interaction.user.id, sounds=sounds)
+        await interaction.response.send_message(embed=manage_view.build_embed(), view=manage_view, ephemeral=True)
+
+
 class SoundboardGroup(app_commands.Group):
     """Subcommands under /soundboard"""
     def __init__(self):
-        super().__init__(name="soundboard", description="Manage server Soundboard sounds and slots")
+        super().__init__(name="soundboard", description="Manage server Soundboard sounds, slots, and deletion")
+
 
 class SoundboardCog(commands.Cog, name="Soundboard Management"):
-    """Server soundboard upload and management operations."""
+    """Server soundboard upload, deletion, and management operations."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -78,7 +128,7 @@ class SoundboardCog(commands.Cog, name="Soundboard Management"):
 
         if not sound:
             await interaction.response.send_message(
-                f"Sound '**{sound_name}**' was not found in catalog. Use `/search` to find sounds.",
+                f"Sound '**{sound_name}**' was not found in catalog. Use `/search` or `/find` to scout sounds.",
                 ephemeral=True
             )
             return
@@ -178,9 +228,81 @@ class SoundboardCog(commands.Cog, name="Soundboard Management"):
         embed.add_field(name="Processed Size", value=f"`{proc_result.file_size // 1024} KB`", inline=True)
         await interaction.followup.send(embed=embed)
 
+    @app_commands.command(name="delete_sound", description="Delete or manage unwanted sounds on your server's soundboard.")
+    @app_commands.describe(sound_name="Optional sound name to delete directly (leave blank to open manager)")
+    @app_commands.autocomplete(sound_name=guild_sound_autocomplete)
+    async def delete_sound_quick(self, interaction: discord.Interaction, sound_name: Optional[str] = None):
+        """Top-level quick command to delete or manage soundboard sounds."""
+        await self._handle_sound_delete_flow(interaction, sound_name)
+
+    @soundboard_group.command(name="delete", description="Delete or manage soundboard sounds you no longer require.")
+    @app_commands.describe(sound_name="Optional sound name to delete directly (leave blank to open manager)")
+    @app_commands.autocomplete(sound_name=guild_sound_autocomplete)
+    async def delete_soundboard(self, interaction: discord.Interaction, sound_name: Optional[str] = None):
+        """Remove a soundboard sound or open the interactive deletion manager."""
+        await self._handle_sound_delete_flow(interaction, sound_name)
+
+    @soundboard_group.command(name="manage", description="Interactive Soundboard Manager to preview, delete, or clear sounds.")
+    async def manage_soundboard(self, interaction: discord.Interaction):
+        """Open the interactive Soundboard Manager dashboard."""
+        await self._handle_sound_delete_flow(interaction, sound_name=None)
+
+    async def _handle_sound_delete_flow(self, interaction: discord.Interaction, sound_name: Optional[str] = None):
+        """Shared logic for sound deletion and soundboard management."""
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Must be used in a Discord server.", ephemeral=True)
+            return
+
+        try:
+            sounds = await interaction.guild.fetch_soundboard_sounds()
+        except Exception:
+            sounds = interaction.guild.soundboard_sounds
+
+        if not sounds:
+            embed = discord.Embed(
+                title="🔊 Soundboard Is Empty",
+                description="There are currently no soundboard sounds installed on this server to delete.\nAdd some using `/search`, `/find`, or `/add`!",
+                color=EMBED_COLOR_DEFAULT
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # Case 1: Sound name provided -> Direct confirmation view
+        if sound_name and sound_name.strip():
+            clean_name = sound_name.strip().lower()
+            target = next((s for s in sounds if s.name.lower() == clean_name), None)
+            if not target:
+                await interaction.response.send_message(
+                    f"Sound '**{sound_name}**' was not found on this server's Soundboard.\nCheck `/soundboard list` for active sounds.",
+                    ephemeral=True
+                )
+                return
+
+            view = SoundboardDeleteConfirmView(sound=target, author_id=interaction.user.id)
+            embed = discord.Embed(
+                title="⚠️ Confirm Sound Deletion",
+                description=(
+                    f"Are you sure you want to delete **{target.name}** from this server's Soundboard?\n\n"
+                    f"• **Volume:** `{target.volume}`\n"
+                    f"• **Sound ID:** `{target.id}`\n"
+                    f"• **Freeing Slot:** `1 slot` will become available"
+                ),
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            return
+
+        # Case 2: No sound name provided -> Open interactive Soundboard Manager
+        manage_view = SoundboardManageView(guild=interaction.guild, author_id=interaction.user.id, sounds=sounds)
+        await interaction.response.send_message(
+            embed=manage_view.build_embed(),
+            view=manage_view,
+            ephemeral=True
+        )
+
     @soundboard_group.command(name="list", description="List all sounds currently active on this server's Soundboard.")
     async def list_soundboard(self, interaction: discord.Interaction):
-        """List active soundboard sounds."""
+        """List active soundboard sounds with a direct 'Manage / Delete Sounds' button."""
         if not interaction.guild:
             await interaction.response.send_message("Must be used in a Discord server.", ephemeral=True)
             return
@@ -192,16 +314,18 @@ class SoundboardCog(commands.Cog, name="Soundboard Management"):
             sounds = interaction.guild.soundboard_sounds
 
         max_slots = TIER_SOUNDBOARD_SLOTS.get(interaction.guild.premium_tier, 8)
+        used = len(sounds)
 
         embed = discord.Embed(
             title=f"🔊 {interaction.guild.name} Soundboard Sounds",
-            description=f"**Capacity:** `{len(sounds)} / {max_slots} slots used`\n"
+            description=f"**Capacity:** `{used} / {max_slots} slots used`\n"
                         f"**Server Boost Level:** `Tier {interaction.guild.premium_tier}`\n\n",
             color=EMBED_COLOR_DEFAULT
         )
 
         if not sounds:
-            embed.description += "*No sounds on this server yet! Add some with `/search` or `/add`.*"
+            embed.description += "*No sounds on this server yet! Add some with `/find`, `/search`, or `/add`.*"
+            await interaction.followup.send(embed=embed)
         else:
             for idx, s in enumerate(sounds, start=1):
                 emoji_str = f"{s.emoji} " if s.emoji else ""
@@ -212,7 +336,8 @@ class SoundboardCog(commands.Cog, name="Soundboard Management"):
                     inline=True
                 )
 
-        await interaction.followup.send(embed=embed)
+            view = SoundboardListActionView(guild=interaction.guild, author_id=interaction.user.id)
+            await interaction.followup.send(embed=embed, view=view)
 
     @soundboard_group.command(name="status", description="Check server Soundboard slot usage, capacity, and boost tier.")
     async def soundboard_status(self, interaction: discord.Interaction):
@@ -231,7 +356,7 @@ class SoundboardCog(commands.Cog, name="Soundboard Management"):
         used = len(sounds)
         available = max(0, max_slots - used)
 
-        pct = int((used / max_slots) * 10)
+        pct = int((used / max_slots) * 10) if max_slots > 0 else 0
         progress_bar = "█" * pct + "░" * (10 - pct)
 
         embed = discord.Embed(
@@ -249,45 +374,6 @@ class SoundboardCog(commands.Cog, name="Soundboard Management"):
 
         await interaction.response.send_message(embed=embed)
 
-    @soundboard_group.command(name="delete", description="Remove a sound from this server's Soundboard.")
-    @app_commands.describe(sound_name="The name of the sound to remove")
-    async def delete_soundboard(self, interaction: discord.Interaction, sound_name: str):
-        """Remove a soundboard sound with confirmation."""
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Must be used in a Discord server.", ephemeral=True)
-            return
-
-        # Check permission
-        user_perms = interaction.user.guild_permissions
-        can_manage = (
-            user_perms.administrator or 
-            getattr(user_perms, "manage_guild_expressions", False) or 
-            getattr(user_perms, "manage_expressions", False)
-        )
-        if not can_manage:
-            await interaction.response.send_message("You need **Manage Expressions** permission to delete soundboard sounds.", ephemeral=True)
-            return
-
-        try:
-            sounds = await interaction.guild.fetch_soundboard_sounds()
-        except Exception:
-            sounds = interaction.guild.soundboard_sounds
-
-        target = next((s for s in sounds if s.name.lower() == sound_name.strip().lower()), None)
-        if not target:
-            await interaction.response.send_message(
-                f"Sound '**{sound_name}**' was not found on this server's Soundboard.\nCheck `/soundboard list` for active sounds.",
-                ephemeral=True
-            )
-            return
-
-        view = SoundboardDeleteConfirmView(sound=target, author_id=interaction.user.id)
-        embed = discord.Embed(
-            title="⚠️ Confirm Sound Deletion",
-            description=f"Are you sure you want to remove **{target.name}** from the server's Soundboard?",
-            color=discord.Color.red()
-        )
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(SoundboardCog(bot))

@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS servers (
     server_id TEXT PRIMARY KEY,
     server_name TEXT NOT NULL,
     sound_limit INTEGER NOT NULL DEFAULT 8,
+    bot_role_id TEXT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -54,6 +55,11 @@ async def init_db(db_path: Path = DATABASE_PATH) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(SCHEMA_SQL)
+        # Migrate schema if bot_role_id column is missing
+        try:
+            await db.execute("ALTER TABLE servers ADD COLUMN bot_role_id TEXT DEFAULT NULL")
+        except Exception:
+            pass
         await db.commit()
     log.info(f"Database initialized successfully at {db_path}")
 

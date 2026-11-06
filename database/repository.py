@@ -133,18 +133,33 @@ class Repository:
 
     # --- Server Operations ---
 
-    async def upsert_server(self, server_id: str, server_name: str, sound_limit: int = 8) -> None:
+    async def upsert_server(self, server_id: str, server_name: str, sound_limit: int = 8, bot_role_id: Optional[str] = None) -> None:
         """Register or update server details."""
         async with self._get_conn() as db:
             await db.execute(
                 """
-                INSERT INTO servers (server_id, server_name, sound_limit)
-                VALUES (?, ?, ?)
+                INSERT INTO servers (server_id, server_name, sound_limit, bot_role_id)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(server_id) DO UPDATE SET
                     server_name = excluded.server_name,
-                    sound_limit = excluded.sound_limit
+                    sound_limit = excluded.sound_limit,
+                    bot_role_id = COALESCE(excluded.bot_role_id, servers.bot_role_id)
                 """,
-                (str(server_id), server_name, sound_limit)
+                (str(server_id), server_name, sound_limit, str(bot_role_id) if bot_role_id else None)
+            )
+            await db.commit()
+
+    async def set_server_bot_role(self, server_id: str, role_id: Optional[str]) -> None:
+        """Configure designated role required to use the bot in a server."""
+        async with self._get_conn() as db:
+            await db.execute(
+                """
+                INSERT INTO servers (server_id, server_name, bot_role_id)
+                VALUES (?, 'Unknown Server', ?)
+                ON CONFLICT(server_id) DO UPDATE SET
+                    bot_role_id = excluded.bot_role_id
+                """,
+                (str(server_id), str(role_id) if role_id else None)
             )
             await db.commit()
 

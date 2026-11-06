@@ -23,6 +23,7 @@ class Server:
     server_id: str
     server_name: str
     sound_limit: int = 8
+    bot_role_id: Optional[str] = None
     created_at: Optional[datetime] = None
 
 @dataclass
