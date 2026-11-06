@@ -17,7 +17,7 @@ from config import (
 from database.models import Sound
 from database.repository import Repository
 from audio.processor import audio_processor
-from ui.modals import SoundCustomizeModal
+from ui.modals import SoundCustomizeModal, SoundTrimModal
 from core.permissions import check_bot_access
 from core.logger import log
 
@@ -47,14 +47,15 @@ async def upload_sound_to_guild(
     user: discord.Member,
     sound: Sound,
     custom_name: Optional[str] = None,
-    volume: float = 1.0
+    volume: float = 1.0,
+    override_bytes: Optional[bytes] = None
 ) -> tuple[bool, str]:
     """
     Core business logic for adding a sound to a guild's soundboard:
     1. Permission verification (higher roles or expressions)
     2. Capacity limit check
     3. Duplicate name check
-    4. Audio file validation and processing
+    4. Audio file validation and processing (guaranteed <= 5.0s, <= 512 KB)
     5. Discord API call (guild.create_soundboard_sound)
     6. Database upload history logging
     """
@@ -103,40 +104,44 @@ async def upload_sound_to_guild(
         await repo.log_upload(str(guild.id), str(user.id), sound.sound_id, final_name, "FAILED", err)
         return False, err
 
-    # 4. Audio preparation & strict Discord duration enforcement (<= 5.0s)
-    sound_path = Path(sound.file_path)
-    if not sound_path.exists():
-        err = f"Audio source file for '{sound.sound_name}' was not found on disk."
-        await repo.log_upload(str(guild.id), str(user.id), sound.sound_id, final_name, "FAILED", err)
-        return False, err
-
-    raw_bytes = sound_path.read_bytes()
-    real_dur = audio_processor.get_duration(raw_bytes)
-    size = len(raw_bytes)
-
-    # Enforce strict <= 5.0s cap with viral peak extraction to guarantee Discord 5.2s limit is never exceeded
-    if real_dur > 5.0 or sound.duration > 5.0 or size > MAX_SOUND_FILE_SIZE_BYTES or sound.file_format not in ("mp3", "ogg"):
-        proc_result = audio_processor.process_and_optimize(raw_bytes, target_format="mp3", max_duration=4.85)
-        if not proc_result.success or not proc_result.processed_bytes:
-            err = proc_result.error or "Failed to optimize audio for Discord Soundboard."
+    # 4. Audio preparation & strict Discord duration enforcement (<= 5.0s, <= 512 KB)
+    if override_bytes:
+        sound_bytes = override_bytes
+        real_dur = audio_processor.get_duration(sound_bytes)
+    else:
+        sound_path = Path(sound.file_path)
+        if not sound_path.exists():
+            err = f"Audio source file for '{sound.sound_name}' was not found on disk."
             await repo.log_upload(str(guild.id), str(user.id), sound.sound_id, final_name, "FAILED", err)
             return False, err
 
-        sound_bytes = proc_result.processed_bytes
-        # Update local cached file & database model with safe duration
-        try:
-            sound_path.write_bytes(sound_bytes)
-            sound.duration = proc_result.duration
-            sound.file_size = proc_result.file_size
-            await repo.add_sound(sound)
-        except Exception as e:
-            log.warning(f"Failed to update cached sound file: {e}")
-    else:
-        sound_bytes = raw_bytes
+        raw_bytes = sound_path.read_bytes()
+        real_dur = audio_processor.get_duration(raw_bytes)
+        size = len(raw_bytes)
 
-    # Final sanity check: guarantee bytes never exceed 5.15s
+        # Enforce strict <= 5.0s cap with viral peak extraction to guarantee Discord 5.2s limit is never exceeded
+        if real_dur > 5.0 or sound.duration > 5.0 or size > MAX_SOUND_FILE_SIZE_BYTES or sound.file_format not in ("mp3", "ogg"):
+            proc_result = audio_processor.process_and_optimize(raw_bytes, target_format="mp3", max_duration=4.85)
+            if not proc_result.success or not proc_result.processed_bytes:
+                err = proc_result.error or "Failed to optimize audio for Discord Soundboard."
+                await repo.log_upload(str(guild.id), str(user.id), sound.sound_id, final_name, "FAILED", err)
+                return False, err
+
+            sound_bytes = proc_result.processed_bytes
+            # Update local cached file & database model with safe duration
+            try:
+                sound_path.write_bytes(sound_bytes)
+                sound.duration = proc_result.duration
+                sound.file_size = proc_result.file_size
+                await repo.add_sound(sound)
+            except Exception as e:
+                log.warning(f"Failed to update cached sound file: {e}")
+        else:
+            sound_bytes = raw_bytes
+
+    # Final sanity check: guarantee bytes never exceed 5.15s under any condition
     if audio_processor.get_duration(sound_bytes) > 5.15:
-        proc_result = audio_processor.process_and_optimize(sound_bytes, target_format="mp3", max_duration=4.75)
+        proc_result = audio_processor.trim_and_optimize(sound_bytes, start_sec=0.0, duration=4.75, target_format="mp3")
         if proc_result.success and proc_result.processed_bytes:
             sound_bytes = proc_result.processed_bytes
 
@@ -166,8 +171,180 @@ async def upload_sound_to_guild(
         return False, err
 
 
+class LongSoundNitroPromptView(discord.ui.View):
+    """
+    Interactive prompt displayed when a sound exceeds Discord's 5.2s Soundboard constraint.
+    Provides users with:
+    1. Direct link to Discord Nitro Shop (https://discord.com/nitro)
+    2. Audio Trimmer Settings button (opens SoundTrimModal to customize trim window <= 5.0s)
+    3. AI Auto-Crop (Viral Hook) button (1-click viral punchline extraction)
+    4. Cancel button
+    """
+
+    def __init__(self, sound: Sound, author_id: int, timeout: float = 180.0):
+        super().__init__(timeout=timeout)
+        self.sound = sound
+        self.author_id = author_id
+
+        sound_path = Path(sound.file_path)
+        if sound_path.exists():
+            v_start, v_end, climax = audio_processor.detect_viral_segment(sound_path)
+            self.suggested_start = v_start
+            self.viral_climax_sec = climax
+        else:
+            self.suggested_start = 0.0
+            self.viral_climax_sec = 0.0
+
+        # Link button pointing to Discord Nitro Shop
+        self.add_item(discord.ui.Button(
+            label="Buy Discord Nitro",
+            style=discord.ButtonStyle.link,
+            url="https://discord.com/nitro",
+            emoji="💎",
+            row=0
+        ))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await verify_user_bot_access(interaction)
+
+    def build_embed(self, duration: Optional[float] = None) -> discord.Embed:
+        dur = duration or self.sound.duration
+        embed = discord.Embed(
+            title="⚠️ Audio Exceeds Discord 5.2s Soundboard Limit",
+            description=(
+                f"The sound **{self.sound.sound_name}** has a duration of **{dur}s**.\n\n"
+                f"Discord requires standard server soundboard clips to be **5.2 seconds or less**.\n\n"
+                f"**Select an option to proceed:**\n"
+                f"• 💎 **Buy Discord Nitro**: Visit the Discord Shop to upgrade your account and unlock server soundboard perks.\n"
+                f"• ✂️ **Audio Trimmer Settings**: Open interactive trimmer settings to pick your custom window (max 5.0s).\n"
+                f"• ⚡ **AI Auto-Crop (Viral Hook)**: Instantly crop the punchiest viral moment (peak detected at `{self.viral_climax_sec}s`)."
+            ),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="Discord API Error 50124 Prevention • Powered by Dissound")
+        return embed
+
+    @discord.ui.button(label="Audio Trimmer Settings", style=discord.ButtonStyle.primary, emoji="✂️", row=0)
+    async def trim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Must be used in a Discord server.", ephemeral=True)
+            return
+
+        async def on_trim_submit(
+            modal_interaction: discord.Interaction,
+            name: str,
+            start_sec: float,
+            dur_sec: float,
+            volume: float
+        ):
+            await modal_interaction.response.defer(ephemeral=True)
+            sound_path = Path(self.sound.file_path)
+            if not sound_path.exists():
+                await modal_interaction.followup.send("Source audio file not found on disk.", ephemeral=True)
+                return
+
+            raw_bytes = sound_path.read_bytes()
+            proc = audio_processor.trim_and_optimize(
+                raw_bytes,
+                start_sec=start_sec,
+                duration=dur_sec,
+                target_format="mp3"
+            )
+            if not proc.success or not proc.processed_bytes:
+                await modal_interaction.followup.send(
+                    f"Trimming failed: {proc.error or 'Could not process audio.'}",
+                    ephemeral=True
+                )
+                return
+
+            trimmed_sound = Sound(
+                sound_id=f"trim_{self.sound.sound_id}_{int(start_sec * 10)}",
+                sound_name=name,
+                category=self.sound.category,
+                file_path=str(sound_path),
+                duration=proc.duration,
+                file_size=proc.file_size,
+                file_format="mp3"
+            )
+
+            success, msg = await upload_sound_to_guild(
+                guild=modal_interaction.guild,
+                user=modal_interaction.user,
+                sound=trimmed_sound,
+                custom_name=name,
+                volume=volume,
+                override_bytes=proc.processed_bytes
+            )
+
+            res_embed = discord.Embed(
+                title="✅ Soundboard Upload: Success!" if success else "❌ Soundboard Upload Failed",
+                description=(
+                    f"{msg}\n\n"
+                    f"✂️ **Trim Window:** `{start_sec}s` - `{round(start_sec + dur_sec, 2)}s` (`{proc.duration}s`)\n"
+                    f"📦 **Output Size:** `{proc.file_size // 1024} KB`"
+                ) if success else msg,
+                color=EMBED_COLOR_SUCCESS if success else EMBED_COLOR_ERROR
+            )
+            await modal_interaction.followup.send(embed=res_embed, ephemeral=True)
+
+        modal = SoundTrimModal(
+            sound_name=self.sound.sound_name,
+            total_duration=self.sound.duration,
+            suggested_start=self.suggested_start,
+            suggested_duration=min(4.85, self.sound.duration),
+            on_submit_callback=on_trim_submit
+        )
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="AI Auto-Crop (Viral Hook)", style=discord.ButtonStyle.success, emoji="⚡", row=0)
+    async def auto_crop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Must be used in a Discord server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        sound_path = Path(self.sound.file_path)
+        if not sound_path.exists():
+            await interaction.followup.send("Source audio file not found on disk.", ephemeral=True)
+            return
+
+        raw_bytes = sound_path.read_bytes()
+        proc = audio_processor.process_and_optimize(raw_bytes, target_format="mp3", max_duration=4.85)
+        if not proc.success or not proc.processed_bytes:
+            await interaction.followup.send(
+                f"Auto-crop failed: {proc.error or 'Could not process audio.'}",
+                ephemeral=True
+            )
+            return
+
+        success, msg = await upload_sound_to_guild(
+            guild=interaction.guild,
+            user=interaction.user,
+            sound=self.sound,
+            custom_name=self.sound.sound_name,
+            volume=1.0,
+            override_bytes=proc.processed_bytes
+        )
+
+        res_embed = discord.Embed(
+            title="✅ Soundboard Upload: Success!" if success else "❌ Soundboard Upload Failed",
+            description=(
+                f"{msg}\n\n"
+                f"⚡ **AI Viral Punchline:** Peak detected at `{proc.viral_climax_sec}s`\n"
+                f"⏱️ **Auto-Trimmed Duration:** `{proc.duration}s` (strictly &le; 5.2s)\n"
+                f"📦 **Output Size:** `{proc.file_size // 1024} KB`"
+            ) if success else msg,
+            color=EMBED_COLOR_SUCCESS if success else EMBED_COLOR_ERROR
+        )
+        await interaction.followup.send(embed=res_embed, ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Sound upload canceled.", embed=None, view=None)
+
+
 class SoundCardView(discord.ui.View):
-    """Interactive view for a single sound with Preview and Add actions."""
+    """Interactive view for a single sound with Preview, Add, and Trimming actions."""
 
     def __init__(self, sound: Sound, author_id: int, timeout: float = 180.0):
         super().__init__(timeout=timeout)
@@ -181,6 +358,16 @@ class SoundCardView(discord.ui.View):
     async def add_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("This command can only be used in a Discord server.", ephemeral=True)
+            return
+
+        sound_path = Path(self.sound.file_path)
+        real_dur = audio_processor.get_duration(sound_path) if sound_path.exists() else self.sound.duration
+
+        # Intercept audio exceeding Discord's 5.0s threshold
+        if real_dur > 5.0 or self.sound.duration > 5.0:
+            prompt_view = LongSoundNitroPromptView(sound=self.sound, author_id=interaction.user.id)
+            embed = prompt_view.build_embed(real_dur)
+            await interaction.response.send_message(embed=embed, view=prompt_view, ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -206,17 +393,34 @@ class SoundCardView(discord.ui.View):
         file = discord.File(str(sound_path), filename=f"{self.sound.sound_id}.{self.sound.file_format}")
         embed = discord.Embed(
             title=f"🔊 Preview: {self.sound.sound_name}",
-            description=f"**Category:** {self.sound.category}\n**Duration:** {self.sound.duration}s",
+            description=f"**Category:** {self.sound.category}\n**Duration:** {self.sound.duration}s\n*Listen to full audio in player above!*",
             color=EMBED_COLOR_DEFAULT
         )
         await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
 
-    @discord.ui.button(label="Customize & Add", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    @discord.ui.button(label="Customize & Trim", style=discord.ButtonStyle.secondary, emoji="⚙️")
     async def customize_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Must be used in a server.", ephemeral=True)
             return
 
+        sound_path = Path(self.sound.file_path)
+        real_dur = audio_processor.get_duration(sound_path) if sound_path.exists() else self.sound.duration
+
+        # If audio is longer than 5.0s, open Trimmer Modal directly
+        if real_dur > 5.0 or self.sound.duration > 5.0:
+            prompt_view = LongSoundNitroPromptView(sound=self.sound, author_id=interaction.user.id)
+            modal = SoundTrimModal(
+                sound_name=self.sound.sound_name,
+                total_duration=real_dur,
+                suggested_start=prompt_view.suggested_start,
+                suggested_duration=min(4.85, real_dur),
+                on_submit_callback=lambda m_inter, name, start, dur, vol: self._handle_modal_trim(m_inter, name, start, dur, vol)
+            )
+            await interaction.response.send_modal(modal)
+            return
+
+        # Otherwise standard customization modal
         async def modal_callback(modal_interaction: discord.Interaction, name: str, volume: float):
             await modal_interaction.response.defer(ephemeral=True)
             success, message = await upload_sound_to_guild(
@@ -235,6 +439,50 @@ class SoundCardView(discord.ui.View):
 
         modal = SoundCustomizeModal(default_name=self.sound.sound_name, on_submit_callback=modal_callback)
         await interaction.response.send_modal(modal)
+
+    async def _handle_modal_trim(
+        self,
+        modal_interaction: discord.Interaction,
+        name: str,
+        start_sec: float,
+        dur_sec: float,
+        volume: float
+    ):
+        await modal_interaction.response.defer(ephemeral=True)
+        sound_path = Path(self.sound.file_path)
+        if not sound_path.exists():
+            await modal_interaction.followup.send("Audio file missing from storage.", ephemeral=True)
+            return
+
+        raw_bytes = sound_path.read_bytes()
+        proc = audio_processor.trim_and_optimize(raw_bytes, start_sec=start_sec, duration=dur_sec, target_format="mp3")
+        if not proc.success or not proc.processed_bytes:
+            await modal_interaction.followup.send(f"Trimming failed: {proc.error}", ephemeral=True)
+            return
+
+        trimmed_sound = Sound(
+            sound_id=f"trim_{self.sound.sound_id}_{int(start_sec * 10)}",
+            sound_name=name,
+            category=self.sound.category,
+            file_path=str(sound_path),
+            duration=proc.duration,
+            file_size=proc.file_size,
+            file_format="mp3"
+        )
+        success, message = await upload_sound_to_guild(
+            guild=modal_interaction.guild,
+            user=modal_interaction.user,
+            sound=trimmed_sound,
+            custom_name=name,
+            volume=volume,
+            override_bytes=proc.processed_bytes
+        )
+        embed = discord.Embed(
+            title="Soundboard Upload: Success!" if success else "Soundboard Upload Failed",
+            description=message,
+            color=EMBED_COLOR_SUCCESS if success else EMBED_COLOR_ERROR
+        )
+        await modal_interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class SoundSelectDropdown(discord.ui.Select):
@@ -260,11 +508,15 @@ class SoundSelectDropdown(discord.ui.Select):
             await interaction.response.send_message("Sound not found.", ephemeral=True)
             return
 
+        dur_tag = f"`{sound.duration}s`"
+        if sound.duration > 5.0:
+            dur_tag += " ⚠️ *(Exceeds Discord 5.2s Soundboard limit)*"
+
         embed = discord.Embed(
             title=f"🎵 {sound.sound_name}",
             description=f"**Category:** {sound.category}\n"
-                        f"**Duration:** `{sound.duration}s` (Max 5.2s)\n"
-                        f"**Size:** `{sound.file_size // 1024} KB` (Max 512 KB)\n"
+                        f"**Duration:** {dur_tag}\n"
+                        f"**Size:** `{sound.file_size // 1024} KB`\n"
                         f"**Format:** `{sound.file_format.upper()}`\n"
                         f"**Tags:** {sound.tags or 'None'}",
             color=EMBED_COLOR_DEFAULT
@@ -517,7 +769,6 @@ class SoundboardManageView(discord.ui.View):
                 "DELETED",
                 "Removed via Soundboard Manager"
             )
-            # Remove from local state
             del self.sounds_dict[selected.id]
             self.selected_sound_id = next(iter(self.sounds_dict.keys()), None)
             self._refresh_components()
@@ -616,13 +867,18 @@ class MemeCandidateHunterView(discord.ui.View):
         else:
             source_badge = "Dissound Library"
 
+        if sound.duration > 5.0:
+            dur_info = f"`{sound.duration}s` ⚠️ *(Exceeds Discord 5.2s limit • Trimmer or Nitro required)*"
+        else:
+            dur_info = f"`{sound.duration}s` ✅ *(Ready for Soundboard &le; 5.2s)*"
+
         embed = discord.Embed(
             title=f"🌐 Internet Meme Scout: '{sound.sound_name}'",
             description=(
                 f"**Search Query:** `{self.query}`\n"
                 f"**Candidate:** `{self.current_index + 1} of {total}`\n\n"
-                f"⏱️ **Duration:** `{sound.duration}s` (Auto-trimmed to Discord &le; 5.2s)\n"
-                f"📦 **File Size:** `{(sound.file_size // 1024)} KB` (Discord &le; 512 KB)\n"
+                f"⏱️ **Duration:** {dur_info}\n"
+                f"📦 **File Size:** `{(sound.file_size // 1024)} KB`\n"
                 f"🏷️ **Category:** `{sound.category}`\n"
                 f"📡 **Source Website:** `{source_badge}`"
             ),
@@ -669,7 +925,7 @@ class MemeCandidateHunterView(discord.ui.View):
         file = discord.File(str(sound_path), filename=f"{sound.sound_id}.mp3")
         embed = discord.Embed(
             title=f"🔊 Playing Preview: {sound.sound_name}",
-            description=f"Candidate #{self.current_index + 1} ({sound.duration}s)\n*Listen in player above!*",
+            description=f"Candidate #{self.current_index + 1} ({sound.duration}s)\n*Listen to full audio in player above!*",
             color=EMBED_COLOR_DEFAULT
         )
         await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
@@ -680,8 +936,18 @@ class MemeCandidateHunterView(discord.ui.View):
             await interaction.response.send_message("Must be used in a Discord server.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
         sound = self.candidates[self.current_index]
+        sound_path = Path(sound.file_path)
+        real_dur = audio_processor.get_duration(sound_path) if sound_path.exists() else sound.duration
+
+        # Intercept audio exceeding Discord's 5.0s threshold
+        if real_dur > 5.0 or sound.duration > 5.0:
+            prompt_view = LongSoundNitroPromptView(sound=sound, author_id=interaction.user.id)
+            embed = prompt_view.build_embed(real_dur)
+            await interaction.response.send_message(embed=embed, view=prompt_view, ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
         success, message = await upload_sound_to_guild(
             guild=interaction.guild,
             user=interaction.user,

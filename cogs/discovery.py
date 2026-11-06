@@ -89,10 +89,14 @@ class DiscoveryCog(commands.Cog, name="Sound Discovery"):
 
         if len(sounds) == 1:
             sound = sounds[0]
+            dur_display = f"`{sound.duration}s`"
+            if sound.duration > 5.0:
+                dur_display += " ⚠️ *(Exceeds Discord 5.2s limit • Trimmer or Nitro required)*"
+
             embed = discord.Embed(
                 title=f"🎵 {sound.sound_name}",
                 description=f"**Category:** {sound.category}\n"
-                            f"**Duration:** `{sound.duration}s`\n"
+                            f"**Duration:** {dur_display}\n"
                             f"**File Size:** `{sound.file_size // 1024} KB`\n"
                             f"**Format:** `{sound.file_format.upper()}`\n"
                             f"**Tags:** {sound.tags or 'None'}",

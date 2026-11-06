@@ -245,20 +245,21 @@ class AudioProcessor:
 
         return AudioValidationResult(True, duration, file_size, ext, None)
 
-    def process_and_optimize(
+    def trim_and_optimize(
         self,
         input_data: Path | bytes,
+        start_sec: float = 0.0,
+        duration: float = SAFE_TARGET_DURATION_SEC,
         target_format: str = "mp3",
-        max_duration: float = SAFE_TARGET_DURATION_SEC,
         normalize: bool = True
     ) -> AudioProcessResult:
         """
-        Convert, crop to viral segment, normalize loudness, and optimize audio for Discord Soundboard.
+        Crop an audio track to user-specified start_sec and duration,
+        normalize loudness, and optimize for Discord Soundboard.
         Guarantees:
-        1. Output format is MP3 or OGG.
-        2. Output duration is strictly <= 5.0s (leaving a guaranteed margin under Discord's 5.2s limit).
-        3. Output size <= 512 KB.
-        4. Embedded album art / video tracks are stripped.
+        1. Result duration strictly <= 5.0s (leaving a guaranteed margin under Discord's 5.2s limit).
+        2. Result file size <= 512 KB.
+        3. Formats to clean MP3/OGG without video tracks or metadata bloat.
         """
         target_format = target_format.lower()
         if target_format not in ("mp3", "ogg"):
@@ -267,27 +268,22 @@ class AudioProcessor:
         codec = "libmp3lame" if target_format == "mp3" else "libvorbis"
         fmt = "mp3" if target_format == "mp3" else "ogg"
 
-        # Cap max_duration safely at 4.85s to guarantee no MP3 padding exceeds 5.20s
-        safe_duration = min(max_duration, SAFE_TARGET_DURATION_SEC)
-
-        # 1. Detect viral punchline segment
-        v_start, v_end, climax_sec = self.detect_viral_segment(input_data, target_duration=safe_duration)
-        clip_len = round(v_end - v_start, 2)
-        if clip_len > safe_duration:
-            v_end = v_start + safe_duration
-            clip_len = safe_duration
+        # Strictly clamp duration: user cannot exceed 5.0s for Discord Soundboard
+        safe_duration = max(0.5, min(duration, 5.0))
+        start_sec = max(0.0, start_sec)
+        end_sec = start_sec + safe_duration
 
         bitrates = ["128k", "96k", "64k"]
         last_error = None
 
         for br in bitrates:
             filters = [
-                f"atrim={v_start}:{v_end}",
+                f"atrim=start={start_sec}:end={end_sec}",
                 "asetpts=PTS-STARTPTS",
                 "afade=t=in:ss=0:d=0.03"
             ]
-            if clip_len > 0.15:
-                fade_out_start = max(0.0, clip_len - 0.08)
+            if safe_duration > 0.15:
+                fade_out_start = max(0.0, safe_duration - 0.08)
                 filters.append(f"afade=t=out:st={fade_out_start}:d=0.08")
 
             if normalize:
@@ -299,7 +295,7 @@ class AudioProcessor:
                 "-i", "pipe:0" if isinstance(input_data, bytes) else str(input_data),
                 "-vn",  # Strip embedded album art / video to save size and avoid duration distortion
                 "-af", ",".join(filters),
-                "-t", str(clip_len),
+                "-t", str(safe_duration),
                 "-ac", "2",
                 "-ar", "44100",
                 "-codec:a", codec,
@@ -317,30 +313,123 @@ class AudioProcessor:
 
             if proc.returncode != 0:
                 last_error = proc.stderr.decode("utf-8", errors="ignore")
-                log.error(f"FFmpeg processing error: {last_error}")
+                log.error(f"FFmpeg trimming error: {last_error}")
                 continue
 
             out_bytes = proc.stdout
             out_size = len(out_bytes)
 
             if out_size <= MAX_SOUND_FILE_SIZE_BYTES:
-                duration = self.get_duration(out_bytes)
-                # If frame padding pushed it slightly, ensure it is capped
-                if duration > 5.15:
-                    # Final safety fallback pass
+                dur = self.get_duration(out_bytes)
+                if dur > 5.15:
+                    # Retry with slightly shorter cut to account for severe encoder padding
+                    safe_duration = max(0.5, safe_duration - 0.2)
+                    end_sec = start_sec + safe_duration
                     continue
                 return AudioProcessResult(
                     success=True,
                     processed_bytes=out_bytes,
-                    duration=duration,
+                    duration=dur,
                     file_size=out_size,
-                    file_format=target_format,
-                    viral_climax_sec=climax_sec
+                    file_format=target_format
                 )
 
         return AudioProcessResult(
             success=False,
             error=last_error or "Processed audio exceeds 512 KB limit even after compression."
         )
+
+    def transcode_and_normalize_full(
+        self,
+        input_data: Path | bytes,
+        max_duration: float = 60.0,
+        target_format: str = "mp3"
+    ) -> AudioProcessResult:
+        """
+        Convert downloaded audio to standard playable MP3 and normalize loudness,
+        keeping the full duration (up to max_duration) for rich previewing.
+        """
+        target_format = target_format.lower()
+        if target_format not in ("mp3", "ogg"):
+            target_format = "mp3"
+
+        codec = "libmp3lame" if target_format == "mp3" else "libvorbis"
+        fmt = "mp3" if target_format == "mp3" else "ogg"
+
+        filters = [
+            f"atrim=start=0:end={max_duration}",
+            "asetpts=PTS-STARTPTS",
+            "afade=t=in:ss=0:d=0.03",
+            "loudnorm=I=-16:TP=-1.5:LRA=11"
+        ]
+
+        cmd = [
+            self.ffmpeg,
+            "-y",
+            "-i", "pipe:0" if isinstance(input_data, bytes) else str(input_data),
+            "-vn",
+            "-af", ",".join(filters),
+            "-t", str(max_duration),
+            "-ac", "2",
+            "-ar", "44100",
+            "-codec:a", codec,
+            "-b:a", "128k",
+            "-write_xing", "1",
+            "-f", fmt, "pipe:1"
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            input=input_data if isinstance(input_data, bytes) else None,
+            capture_output=True
+        )
+
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="ignore")
+            return AudioProcessResult(success=False, error=err)
+
+        out_bytes = proc.stdout
+        dur = self.get_duration(out_bytes)
+        return AudioProcessResult(
+            success=True,
+            processed_bytes=out_bytes,
+            duration=dur,
+            file_size=len(out_bytes),
+            file_format=target_format
+        )
+
+    def process_and_optimize(
+        self,
+        input_data: Path | bytes,
+        target_format: str = "mp3",
+        max_duration: float = SAFE_TARGET_DURATION_SEC,
+        normalize: bool = True
+    ) -> AudioProcessResult:
+        """
+        Convert, crop to viral segment, normalize loudness, and optimize audio for Discord Soundboard.
+        Guarantees:
+        1. Output format is MP3 or OGG.
+        2. Output duration is strictly <= 5.0s (leaving a guaranteed margin under Discord's 5.2s limit).
+        3. Output size <= 512 KB.
+        4. Embedded album art / video tracks are stripped.
+        """
+        # Cap max_duration safely at 4.85s to guarantee no MP3 padding exceeds 5.20s
+        safe_duration = min(max_duration, SAFE_TARGET_DURATION_SEC)
+
+        # 1. Detect viral punchline segment
+        v_start, v_end, climax_sec = self.detect_viral_segment(input_data, target_duration=safe_duration)
+        clip_len = round(v_end - v_start, 2)
+        if clip_len > safe_duration:
+            clip_len = safe_duration
+
+        res = self.trim_and_optimize(
+            input_data,
+            start_sec=v_start,
+            duration=clip_len,
+            target_format=target_format,
+            normalize=normalize
+        )
+        res.viral_climax_sec = climax_sec
+        return res
 
 audio_processor = AudioProcessor()

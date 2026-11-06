@@ -264,8 +264,9 @@ class MemeSoundScoutAgent:
 
     async def fetch_and_process_candidate(self, candidate_info: dict, category: str = "Internet Meme") -> Optional[Sound]:
         """
-        Downloads a candidate audio clip from the web, auto-trims to <=5.2s,
-        normalizes loudness, and adds to Dissound's SQLite database.
+        Downloads a candidate audio clip from the web, transcodes to standard MP3,
+        preserves the full audio duration (up to 60s) for user previewing,
+        and adds to Dissound's SQLite database.
         """
         sound_url = candidate_info["sound_url"]
         title = candidate_info["title"].strip()
@@ -276,11 +277,10 @@ class MemeSoundScoutAgent:
         slug_clean = re.sub(r"[^a-zA-Z0-9_]", "_", candidate_info.get("slug", "sound").lower())[:20]
         safe_id = f"net_{slug_clean}_{url_hash}"
 
-        # Check if already processed and stored in database (ensure duration conforms strictly <= 5.0s)
+        # Check if already processed and stored in database
         existing = await self.repo.get_sound(safe_id)
         if existing and Path(existing.file_path).exists():
-            if existing.duration <= 5.0 and audio_processor.get_duration(Path(existing.file_path)) <= 5.0:
-                return existing
+            return existing
 
         try:
             async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
@@ -289,10 +289,10 @@ class MemeSoundScoutAgent:
                         return None
                     raw_bytes = await resp.read()
 
-            # Process and auto-trim using FFmpeg to enforce Discord rules (<= 5.2s, <= 512KB)
-            proc = audio_processor.process_and_optimize(raw_bytes, target_format="mp3")
+            # Transcode & normalize full audio to playable MP3 (keeping up to 60s for full preview)
+            proc = audio_processor.transcode_and_normalize_full(raw_bytes, max_duration=60.0, target_format="mp3")
             if not proc.success or not proc.processed_bytes:
-                log.warning(f"Failed to optimize candidate '{title}' from {source}: {proc.error}")
+                log.warning(f"Failed to transcode candidate '{title}' from {source}: {proc.error}")
                 return None
 
             # Save to web_cache

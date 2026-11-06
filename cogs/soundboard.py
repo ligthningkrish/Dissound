@@ -23,6 +23,7 @@ from ui.views import (
     upload_sound_to_guild,
     SoundboardDeleteConfirmView,
     SoundboardManageView,
+    LongSoundNitroPromptView,
     verify_user_bot_access
 )
 from core.permissions import check_bot_access
@@ -131,6 +132,15 @@ class SoundboardCog(commands.Cog, name="Soundboard Management"):
                 f"Sound '**{sound_name}**' was not found in catalog. Use `/search` or `/find` to scout sounds.",
                 ephemeral=True
             )
+            return
+
+        # Check if duration exceeds Discord's 5.0s threshold
+        sound_path = Path(sound.file_path)
+        real_dur = audio_processor.get_duration(sound_path) if sound_path.exists() else sound.duration
+        if real_dur > 5.0 or sound.duration > 5.0:
+            prompt_view = LongSoundNitroPromptView(sound=sound, author_id=interaction.user.id)
+            embed = prompt_view.build_embed(real_dur)
+            await interaction.response.send_message(embed=embed, view=prompt_view, ephemeral=True)
             return
 
         await interaction.response.defer(thinking=True)
