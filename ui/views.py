@@ -348,6 +348,24 @@ class MemeCandidateHunterView(discord.ui.View):
     def build_embed(self) -> discord.Embed:
         sound = self.candidates[self.current_index]
         total = len(self.candidates)
+
+        # Detect source website from tags or sound_id
+        tags_lower = (sound.tags or "").lower()
+        if "myinstants" in tags_lower or "myinstants" in sound.sound_id:
+            source_badge = "Myinstants"
+        elif "soundboardmax" in tags_lower or "sbmax" in sound.sound_id:
+            source_badge = "SoundboardMax"
+        elif "soundboard guy" in tags_lower or "sbguy" in sound.sound_id:
+            source_badge = "Soundboard Guy"
+        elif "orange" in tags_lower or "orange" in sound.sound_id:
+            source_badge = "Orange Free Sounds"
+        elif "freesound" in tags_lower or "freesound" in sound.sound_id:
+            source_badge = "Freesound"
+        elif sound.source_url:
+            source_badge = "Web Sound Repository"
+        else:
+            source_badge = "Dissound Library"
+
         embed = discord.Embed(
             title=f"🌐 Internet Meme Scout: '{sound.sound_name}'",
             description=(
@@ -356,7 +374,7 @@ class MemeCandidateHunterView(discord.ui.View):
                 f"⏱️ **Duration:** `{sound.duration}s` (Auto-trimmed to Discord &le; 5.2s)\n"
                 f"📦 **File Size:** `{(sound.file_size // 1024)} KB` (Discord &le; 512 KB)\n"
                 f"🏷️ **Category:** `{sound.category}`\n"
-                f"🔗 **Source:** Real Web Audio Clip"
+                f"📡 **Source Website:** `{source_badge}`"
             ),
             color=EMBED_COLOR_DEFAULT
         )

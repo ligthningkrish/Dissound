@@ -173,11 +173,13 @@ class AudioProcessor:
         codec = "libmp3lame" if target_format == "mp3" else "libvorbis"
         fmt = "mp3" if target_format == "mp3" else "ogg"
 
+        # Safe duration buffer (5.0s) prevents MP3 frame boundary padding from exceeding Discord's 5.2s limit
+        safe_duration = min(max_duration, 5.0)
         bitrates = ["128k", "96k", "64k"]
 
         last_error = None
         for br in bitrates:
-            filters = [f"atrim=0:{max_duration}", "asetpts=PTS-STARTPTS"]
+            filters = [f"atrim=0:{safe_duration}", "asetpts=PTS-STARTPTS"]
             if normalize:
                 filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
 
@@ -185,14 +187,17 @@ class AudioProcessor:
                 self.ffmpeg,
                 "-y",
                 "-i", "pipe:0" if isinstance(input_data, bytes) else str(input_data),
+                "-vn",  # Strip embedded album art / thumbnails to save size and fix duration metadata
                 "-af", ",".join(filters),
+                "-t", str(safe_duration),
                 "-ac", "2",
                 "-ar", "44100",
                 "-codec:a", codec,
                 "-b:a", br,
-                "-f", fmt,
-                "pipe:1"
             ]
+            if target_format == "mp3":
+                cmd.extend(["-write_xing", "1"])
+            cmd.extend(["-f", fmt, "pipe:1"])
 
             proc = subprocess.run(
                 cmd,
