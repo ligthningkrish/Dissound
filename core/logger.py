@@ -5,6 +5,13 @@ import logging
 import sys
 
 def setup_logger(name: str = "Dissound") -> logging.Logger:
+    # Ensure Windows console streams support UTF-8 characters without CharMapEncode errors
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     logger = logging.getLogger(name)
     if not logger.handlers:
         logger.setLevel(logging.INFO)

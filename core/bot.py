@@ -32,38 +32,42 @@ class DissoundBot(commands.Bot):
         )
         self.repo = Repository()
 
-    async def setup_hook(self) -> None:
-        """Called automatically during bot initialization."""
-        log.info("Running pre-flight checks and initializing database...")
-        await init_db()
-        await seed_database()
-
-        # Enforce global access control: Only higher roles or bot permissions can use Dissound
-        @self.tree.interaction_check
-        async def global_bot_access_check(interaction: discord.Interaction) -> bool:
-            # All commands must be run within a guild
-            if not interaction.guild or not isinstance(interaction.user, discord.Member):
+    async def global_bot_access_check(self, interaction: discord.Interaction) -> bool:
+        """Global interaction check ensuring user has higher roles or bot permissions."""
+        # All commands must be run within a guild
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            if not interaction.response.is_done():
                 await interaction.response.send_message(
                     "Dissound commands can only be used inside a Discord server.",
                     ephemeral=True
                 )
-                return False
+            return False
 
-            allowed, reason = await check_bot_access(interaction.user)
-            if not allowed:
-                embed = discord.Embed(
-                    title="⛔ Higher Roles Required",
-                    description=reason,
-                    color=discord.Color.red()
-                )
-                embed.set_footer(text="Ask a server administrator to grant you the 'Bot Permissions' role.")
-                if interaction.response.is_done():
-                    await interaction.followup.send(embed=embed, ephemeral=True)
-                else:
-                    await interaction.response.send_message(embed=embed, ephemeral=True)
-                return False
+        allowed, reason = await check_bot_access(interaction.user)
+        if not allowed:
+            embed = discord.Embed(
+                title="⛔ Higher Roles Required",
+                description=reason,
+                color=discord.Color.red()
+            )
+            embed.set_footer(text="Ask a server administrator to grant you the 'Bot Permissions' role.")
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+            return False
 
-            return True
+        return True
+
+    async def setup_hook(self) -> None:
+        """Called automatically during bot initialization."""
+        # 1. Wire global tree handlers
+        self.tree.interaction_check = self.global_bot_access_check
+        self.tree.on_error = self.on_app_command_error
+
+        log.info("Running pre-flight checks and initializing database...")
+        await init_db()
+        await seed_database()
 
         # Load extension cogs
         for ext in INITIAL_EXTENSIONS:
@@ -102,7 +106,13 @@ class DissoundBot(commands.Bot):
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         """Global error handler for slash commands."""
-        log.error(f"Command '{interaction.command.name if interaction.command else 'Unknown'}' error: {error}")
+        log.error(f"Command '{interaction.command.name if interaction.command else 'Unknown'}' error: {error}", exc_info=True)
+
+        if isinstance(error, app_commands.CheckFailure):
+            # Already handled in interaction_check
+            if not interaction.response.is_done():
+                await interaction.response.send_message("⛔ You do not have permission to use this command.", ephemeral=True)
+            return
 
         if isinstance(error, app_commands.MissingPermissions):
             missing = ", ".join(error.missing_permissions)
@@ -115,7 +125,10 @@ class DissoundBot(commands.Bot):
         else:
             msg = f"⚠️ An error occurred while executing this command: {str(error)}"
 
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception as e:
+            log.warning(f"Failed to deliver command error response: {e}")

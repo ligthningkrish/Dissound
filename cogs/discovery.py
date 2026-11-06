@@ -39,52 +39,87 @@ class DiscoveryCog(commands.Cog, name="Sound Discovery"):
     @app_commands.describe(query="Name or description of the meme sound (e.g. emotional damage, metal pipe, anime wow)")
     async def find(self, interaction: discord.Interaction, query: str):
         """AI Scout searches internet repositories, downloads & auto-trims candidates, and opens preview carousel."""
-        await interaction.response.defer(thinking=True)
+        # Immediate deferral to guarantee Discord receives response within the 3-second limit
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(thinking=True)
+        except Exception as e:
+            log.warning(f"Could not defer interaction in /find: {e}")
 
-        # 1. AI Scout searches the internet and downloads/trims candidate clips
-        candidates = await meme_scout.scout_and_index_meme_sounds(query, max_candidates=5)
+        try:
+            # 1. AI Scout searches the internet and downloads/trims candidate clips
+            candidates = await meme_scout.scout_and_index_meme_sounds(query, max_candidates=5)
 
-        if not candidates:
-            # Fallback to local search
-            local_matches = await repo.search_sounds(query, limit=5)
-            candidates = local_matches
+            if not candidates:
+                # Fallback to local search
+                local_matches = await repo.search_sounds(query, limit=5)
+                candidates = local_matches
 
-        if not candidates:
-            embed = discord.Embed(
-                title="🔍 No Meme Sounds Located",
-                description=f"The AI Scout couldn't find audio clips matching '**{query}**'.\nTry alternative keywords like `vine boom`, `airhorn`, `bruh`, or `emotional damage`.",
+            if not candidates:
+                embed = discord.Embed(
+                    title="🔍 No Meme Sounds Located",
+                    description=f"The AI Scout couldn't find audio clips matching '**{query}**'.\nTry alternative keywords like `vine boom`, `airhorn`, `bruh`, or `emotional damage`.",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed)
+                return
+
+            # 2. Present interactive candidate previewer
+            view = MemeCandidateHunterView(candidates=candidates, author_id=interaction.user.id, query=query)
+            await interaction.followup.send(embed=view.build_embed(), view=view)
+        except Exception as e:
+            log.error(f"Error in /find command: {e}", exc_info=True)
+            err_embed = discord.Embed(
+                title="⚠️ Discovery Search Error",
+                description=f"An error occurred while scouting meme sounds: `{str(e)}`",
                 color=discord.Color.red()
             )
-            await interaction.followup.send(embed=embed)
-            return
-
-        # 2. Present interactive candidate previewer
-        view = MemeCandidateHunterView(candidates=candidates, author_id=interaction.user.id, query=query)
-        await interaction.followup.send(embed=view.build_embed(), view=view)
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=err_embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=err_embed, ephemeral=True)
 
     @app_commands.command(name="search", description="Search the meme sound library with automatic internet scout fallback.")
     @app_commands.describe(query="Name, keyword, or tag of the sound (e.g. vine boom, metal pipe, error)")
     @app_commands.autocomplete(query=sound_name_autocomplete)
     async def search(self, interaction: discord.Interaction, query: str):
         """Search sounds locally or scout the internet if not found."""
-        sounds = await repo.search_sounds(query, limit=25)
+        try:
+            sounds = await repo.search_sounds(query, limit=25)
 
-        if not sounds:
-            # Automatic Internet Scout fallback
-            await interaction.response.defer(thinking=True)
-            candidates = await meme_scout.scout_and_index_meme_sounds(query, max_candidates=5)
+            if not sounds:
+                # Automatic Internet Scout fallback with immediate defer
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.defer(thinking=True)
+                except Exception as e:
+                    log.warning(f"Could not defer interaction in /search: {e}")
 
-            if not candidates:
-                embed = discord.Embed(
-                    title="🔍 No Sounds Found",
-                    description=f"Could not find any meme sounds matching '**{query}**' locally or on the web.",
-                    color=discord.Color.dark_grey()
-                )
-                await interaction.followup.send(embed=embed)
+                candidates = await meme_scout.scout_and_index_meme_sounds(query, max_candidates=5)
+
+                if not candidates:
+                    embed = discord.Embed(
+                        title="🔍 No Sounds Found",
+                        description=f"Could not find any meme sounds matching '**{query}**' locally or on the web.",
+                        color=discord.Color.dark_grey()
+                    )
+                    await interaction.followup.send(embed=embed)
+                    return
+
+                view = MemeCandidateHunterView(candidates=candidates, author_id=interaction.user.id, query=query)
+                await interaction.followup.send(embed=view.build_embed(), view=view)
                 return
-
-            view = MemeCandidateHunterView(candidates=candidates, author_id=interaction.user.id, query=query)
-            await interaction.followup.send(embed=view.build_embed(), view=view)
+        except Exception as e:
+            log.error(f"Error in /search command: {e}", exc_info=True)
+            err_embed = discord.Embed(
+                title="⚠️ Search Error",
+                description=f"An error occurred while searching: `{str(e)}`",
+                color=discord.Color.red()
+            )
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=err_embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=err_embed, ephemeral=True)
             return
 
         if len(sounds) == 1:

@@ -86,10 +86,13 @@ async def check_bot_access(member: discord.Member) -> Tuple[bool, Optional[str]]
 
     # 4. Elevated Role Names (e.g. 'Bot Permissions', 'Soundboard Manager', 'Mod', etc.)
     for role in member.roles:
-        r_name = role.name.strip().lower()
-        if r_name in ELEVATED_ROLE_KEYWORDS:
+        r_name = getattr(role, "name", "")
+        if not r_name:
+            continue
+        r_name_clean = r_name.strip().lower()
+        if r_name_clean in ELEVATED_ROLE_KEYWORDS:
             return True, None
-        if "bot perm" in r_name or "soundboard" in r_name:
+        if "bot perm" in r_name_clean or "soundboard" in r_name_clean:
             return True, None
 
     denial_msg = (

@@ -289,8 +289,13 @@ class MemeSoundScoutAgent:
                         return None
                     raw_bytes = await resp.read()
 
-            # Transcode & normalize full audio to playable MP3 (keeping up to 60s for full preview)
-            proc = audio_processor.transcode_and_normalize_full(raw_bytes, max_duration=60.0, target_format="mp3")
+            # Transcode & normalize full audio to playable MP3 in background worker thread
+            proc = await asyncio.to_thread(
+                audio_processor.transcode_and_normalize_full,
+                raw_bytes,
+                60.0,
+                "mp3"
+            )
             if not proc.success or not proc.processed_bytes:
                 log.warning(f"Failed to transcode candidate '{title}' from {source}: {proc.error}")
                 return None
