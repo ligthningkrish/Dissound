@@ -78,14 +78,19 @@ class DissoundBot(commands.Bot):
                 log.error(f"Failed to load extension {ext}: {e}", exc_info=True)
 
         # Sync application commands
+        # 1. Global sync so any server the bot joins has access to all slash commands
+        synced = await self.tree.sync()
+        log.info(f"🌐 Synced {len(synced)} slash commands globally across Discord.")
+
+        # 2. Instant sync to dev guild if configured
         if DEV_GUILD_ID:
-            guild_obj = discord.Object(id=DEV_GUILD_ID)
-            self.tree.copy_global_to(guild=guild_obj)
-            synced = await self.tree.sync(guild=guild_obj)
-            log.info(f"⚡ Synced {len(synced)} slash commands instantly to DEV_GUILD_ID: {DEV_GUILD_ID}")
-        else:
-            synced = await self.tree.sync()
-            log.info(f"🌐 Synced {len(synced)} slash commands globally across Discord.")
+            try:
+                guild_obj = discord.Object(id=DEV_GUILD_ID)
+                self.tree.copy_global_to(guild=guild_obj)
+                synced_dev = await self.tree.sync(guild=guild_obj)
+                log.info(f"⚡ Synced {len(synced_dev)} slash commands instantly to DEV_GUILD_ID: {DEV_GUILD_ID}")
+            except Exception as e:
+                log.warning(f"Could not sync to DEV_GUILD_ID: {e}")
 
     async def on_ready(self) -> None:
         """Event triggered when Discord connection is established."""
@@ -100,9 +105,15 @@ class DissoundBot(commands.Bot):
         await self.change_presence(status=discord.Status.online, activity=activity)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
-        """Store guild details in database when joined."""
+        """Store guild details in database and sync slash commands instantly to the new server."""
         log.info(f"Joined new guild: {guild.name} (ID: {guild.id})")
         await self.repo.upsert_server(str(guild.id), guild.name)
+        try:
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info(f"⚡ Instantly synced {len(synced)} slash commands to newly joined guild: {guild.name}")
+        except Exception as e:
+            log.warning(f"Could not instant sync to {guild.name}: {e}")
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         """Global error handler for slash commands."""

@@ -149,6 +149,29 @@ class SettingsCog(commands.Cog, name="Settings & Access Control"):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    @app_commands.command(name="invite", description="Get an invite link to add Dissound to other Discord servers.")
+    async def invite(self, interaction: discord.Interaction):
+        """Generates an OAuth2 invite URL with necessary soundboard permissions."""
+        client_id = self.bot.user.id if self.bot.user else ""
+        perms_int = 414464731136
+        invite_url = f"https://discord.com/oauth2/authorize?client_id={client_id}&permissions={perms_int}&scope=bot%20applications.commands"
+
+        embed = discord.Embed(
+            title="🤖 Invite Dissound to Your Server",
+            description=(
+                "Bring the AI Meme Soundboard Scout to your community!\n\n"
+                "**Required Bot Permissions Included:**\n"
+                "• **Create & Manage Expressions** (Upload and delete Soundboard sounds)\n"
+                "• **Send Messages, Embed Links & Attach Files** (Audio player previews & menus)\n"
+                "• **Slash Commands (`applications.commands`)**\n\n"
+                "Click the button below to add Dissound to any server where you have *Manage Server* or *Admin* permissions."
+            ),
+            color=EMBED_COLOR_DEFAULT
+        )
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="Invite Dissound", style=discord.ButtonStyle.link, url=invite_url, emoji="➕"))
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(SettingsCog(bot))
