@@ -103,28 +103,42 @@ async def upload_sound_to_guild(
         await repo.log_upload(str(guild.id), str(user.id), sound.sound_id, final_name, "FAILED", err)
         return False, err
 
-    # 4. Audio preparation
+    # 4. Audio preparation & strict Discord duration enforcement (<= 5.0s)
     sound_path = Path(sound.file_path)
     if not sound_path.exists():
         err = f"Audio source file for '{sound.sound_name}' was not found on disk."
         await repo.log_upload(str(guild.id), str(user.id), sound.sound_id, final_name, "FAILED", err)
         return False, err
 
-    # Read bytes and optimize if needed
     raw_bytes = sound_path.read_bytes()
-    dur = sound.duration
+    real_dur = audio_processor.get_duration(raw_bytes)
     size = len(raw_bytes)
 
-    # Process and optimize if duration or size exceeds or format isn't mp3/ogg
-    if dur > MAX_SOUND_DURATION_SEC or size > MAX_SOUND_FILE_SIZE_BYTES or sound.file_format not in ("mp3", "ogg"):
-        proc_result = audio_processor.process_and_optimize(raw_bytes, target_format="mp3")
+    # Enforce strict <= 5.0s cap with viral peak extraction to guarantee Discord 5.2s limit is never exceeded
+    if real_dur > 5.0 or sound.duration > 5.0 or size > MAX_SOUND_FILE_SIZE_BYTES or sound.file_format not in ("mp3", "ogg"):
+        proc_result = audio_processor.process_and_optimize(raw_bytes, target_format="mp3", max_duration=4.85)
         if not proc_result.success or not proc_result.processed_bytes:
             err = proc_result.error or "Failed to optimize audio for Discord Soundboard."
             await repo.log_upload(str(guild.id), str(user.id), sound.sound_id, final_name, "FAILED", err)
             return False, err
+
         sound_bytes = proc_result.processed_bytes
+        # Update local cached file & database model with safe duration
+        try:
+            sound_path.write_bytes(sound_bytes)
+            sound.duration = proc_result.duration
+            sound.file_size = proc_result.file_size
+            await repo.add_sound(sound)
+        except Exception as e:
+            log.warning(f"Failed to update cached sound file: {e}")
     else:
         sound_bytes = raw_bytes
+
+    # Final sanity check: guarantee bytes never exceed 5.15s
+    if audio_processor.get_duration(sound_bytes) > 5.15:
+        proc_result = audio_processor.process_and_optimize(sound_bytes, target_format="mp3", max_duration=4.75)
+        if proc_result.success and proc_result.processed_bytes:
+            sound_bytes = proc_result.processed_bytes
 
     # 5. Call Discord API
     try:

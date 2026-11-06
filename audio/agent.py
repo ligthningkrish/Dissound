@@ -276,10 +276,11 @@ class MemeSoundScoutAgent:
         slug_clean = re.sub(r"[^a-zA-Z0-9_]", "_", candidate_info.get("slug", "sound").lower())[:20]
         safe_id = f"net_{slug_clean}_{url_hash}"
 
-        # Check if already processed and stored in database
+        # Check if already processed and stored in database (ensure duration conforms strictly <= 5.0s)
         existing = await self.repo.get_sound(safe_id)
         if existing and Path(existing.file_path).exists():
-            return existing
+            if existing.duration <= 5.0 and audio_processor.get_duration(Path(existing.file_path)) <= 5.0:
+                return existing
 
         try:
             async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:

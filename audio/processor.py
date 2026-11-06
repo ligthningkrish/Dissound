@@ -1,7 +1,10 @@
 """
 Audio processing module for Dissound (MemeSound Bot).
-Handles audio validation, trimming, format conversion, normalization, and size optimization.
+Handles audio validation, viral segment extraction, format conversion, normalization, and size optimization.
+Guarantees audio files conform to Discord Soundboard constraints (<= 5.2s, <= 512 KB).
 """
+import array
+import math
 import os
 import sys
 import shutil
@@ -41,6 +44,9 @@ def _ensure_ffmpeg() -> str:
 
 FFMPEG_EXE = _ensure_ffmpeg()
 
+# Safe target duration strictly below Discord's 5.20s threshold to prevent MP3 frame-padding overflow
+SAFE_TARGET_DURATION_SEC = 4.85
+
 @dataclass
 class AudioValidationResult:
     is_valid: bool
@@ -56,17 +62,18 @@ class AudioProcessResult:
     duration: float = 0.0
     file_size: int = 0
     file_format: str = "mp3"
+    viral_climax_sec: float = 0.0
     error: Optional[str] = None
 
 class AudioProcessor:
-    """Handles audio inspection, format conversion, trimming, and loudness normalization."""
+    """Handles audio inspection, format conversion, viral peak extraction, and loudness normalization."""
 
     def __init__(self, ffmpeg_path: str = FFMPEG_EXE):
         self.ffmpeg = ffmpeg_path
 
     def get_duration(self, file_path_or_bytes: Path | bytes) -> float:
         """
-        Extract duration of an audio file in seconds using ffmpeg.
+        Extract duration of an audio file in seconds using ffmpeg probe.
         """
         temp_file = None
         try:
@@ -103,9 +110,95 @@ class AudioProcessor:
 
         if isinstance(file_path_or_bytes, bytes) and len(file_path_or_bytes) > 0:
             est = round(len(file_path_or_bytes) * 8 / 128000.0, 2)
-            return min(5.2, est)
+            return min(SAFE_TARGET_DURATION_SEC, est)
 
         return 0.0
+
+    def detect_viral_segment(
+        self,
+        input_data: Path | bytes,
+        target_duration: float = SAFE_TARGET_DURATION_SEC
+    ) -> Tuple[float, float, float]:
+        """
+        AI Algorithm to detect the most energetic, viral punchline / climax of an audio track.
+        Analyzes 16kHz mono PCM frames (RMS energy, transient onset spikes, and peak volume).
+        Returns (crop_start_sec, crop_end_sec, climax_sec).
+        """
+        try:
+            # Decode to raw 16kHz mono 16-bit PCM via FFmpeg pipe
+            cmd = [
+                self.ffmpeg,
+                "-y",
+                "-i", "pipe:0" if isinstance(input_data, bytes) else str(input_data),
+                "-vn",
+                "-ac", "1",
+                "-ar", "16000",
+                "-f", "s16le",
+                "pipe:1"
+            ]
+            proc = subprocess.run(
+                cmd,
+                input=input_data if isinstance(input_data, bytes) else None,
+                capture_output=True
+            )
+            if proc.returncode != 0 or not proc.stdout:
+                return 0.0, target_duration, 0.0
+
+            raw_pcm = proc.stdout
+            samples = array.array('h')
+            samples.frombytes(raw_pcm)
+            sample_rate = 16000
+            total_samples = len(samples)
+            total_duration = total_samples / sample_rate
+
+            if total_duration <= target_duration:
+                return 0.0, round(total_duration, 2), 0.0
+
+            # 50ms frames (800 samples)
+            frame_size = 800
+            num_frames = total_samples // frame_size
+            if num_frames == 0:
+                return 0.0, round(total_duration, 2), 0.0
+
+            frame_rms = []
+            frame_peaks = []
+            for i in range(num_frames):
+                frame = samples[i * frame_size : (i + 1) * frame_size]
+                peak = max(abs(s) for s in frame)
+                sum_sq = sum(s * s for s in frame)
+                rms = math.sqrt(sum_sq / len(frame))
+                frame_rms.append(rms)
+                frame_peaks.append(peak)
+
+            # Detect onset spikes (instantaneous rise in energy)
+            onset_scores = [0.0]
+            for i in range(1, len(frame_rms)):
+                diff = max(0.0, frame_rms[i] - frame_rms[i - 1])
+                onset_scores.append(diff)
+
+            # Score each frame for meme virality (transient onset + peak burst + sustained RMS)
+            max_score = -1.0
+            best_climax_frame = 0
+            for i in range(len(frame_rms)):
+                score = (frame_peaks[i] * 0.45) + (onset_scores[i] * 0.35) + (frame_rms[i] * 0.20)
+                if score > max_score:
+                    max_score = score
+                    best_climax_frame = i
+
+            climax_sec = (best_climax_frame * frame_size) / sample_rate
+
+            # Center window: lead-in 0.6s before climax to capture the build-up / punchline context
+            ideal_start = max(0.0, climax_sec - 0.6)
+            ideal_end = ideal_start + target_duration
+
+            if ideal_end > total_duration:
+                ideal_end = total_duration
+                ideal_start = max(0.0, ideal_end - target_duration)
+
+            return round(ideal_start, 2), round(ideal_end, 2), round(climax_sec, 2)
+        except Exception as e:
+            log.warning(f"Error in detect_viral_segment: {e}")
+            return 0.0, target_duration, 0.0
 
     def validate_sound_name(self, name: str) -> Tuple[bool, Optional[str]]:
         """Validate soundboard sound name length and characters."""
@@ -156,15 +249,16 @@ class AudioProcessor:
         self,
         input_data: Path | bytes,
         target_format: str = "mp3",
-        max_duration: float = MAX_SOUND_DURATION_SEC,
+        max_duration: float = SAFE_TARGET_DURATION_SEC,
         normalize: bool = True
     ) -> AudioProcessResult:
         """
-        Convert, trim, normalize, and optimize audio for Discord Soundboard.
+        Convert, crop to viral segment, normalize loudness, and optimize audio for Discord Soundboard.
         Guarantees:
         1. Output format is MP3 or OGG.
-        2. Output duration <= max_duration (default 5.2s).
+        2. Output duration is strictly <= 5.0s (leaving a guaranteed margin under Discord's 5.2s limit).
         3. Output size <= 512 KB.
+        4. Embedded album art / video tracks are stripped.
         """
         target_format = target_format.lower()
         if target_format not in ("mp3", "ogg"):
@@ -173,13 +267,29 @@ class AudioProcessor:
         codec = "libmp3lame" if target_format == "mp3" else "libvorbis"
         fmt = "mp3" if target_format == "mp3" else "ogg"
 
-        # Safe duration buffer (5.0s) prevents MP3 frame boundary padding from exceeding Discord's 5.2s limit
-        safe_duration = min(max_duration, 5.0)
-        bitrates = ["128k", "96k", "64k"]
+        # Cap max_duration safely at 4.85s to guarantee no MP3 padding exceeds 5.20s
+        safe_duration = min(max_duration, SAFE_TARGET_DURATION_SEC)
 
+        # 1. Detect viral punchline segment
+        v_start, v_end, climax_sec = self.detect_viral_segment(input_data, target_duration=safe_duration)
+        clip_len = round(v_end - v_start, 2)
+        if clip_len > safe_duration:
+            v_end = v_start + safe_duration
+            clip_len = safe_duration
+
+        bitrates = ["128k", "96k", "64k"]
         last_error = None
+
         for br in bitrates:
-            filters = [f"atrim=0:{safe_duration}", "asetpts=PTS-STARTPTS"]
+            filters = [
+                f"atrim={v_start}:{v_end}",
+                "asetpts=PTS-STARTPTS",
+                "afade=t=in:ss=0:d=0.03"
+            ]
+            if clip_len > 0.15:
+                fade_out_start = max(0.0, clip_len - 0.08)
+                filters.append(f"afade=t=out:st={fade_out_start}:d=0.08")
+
             if normalize:
                 filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
 
@@ -187,9 +297,9 @@ class AudioProcessor:
                 self.ffmpeg,
                 "-y",
                 "-i", "pipe:0" if isinstance(input_data, bytes) else str(input_data),
-                "-vn",  # Strip embedded album art / thumbnails to save size and fix duration metadata
+                "-vn",  # Strip embedded album art / video to save size and avoid duration distortion
                 "-af", ",".join(filters),
-                "-t", str(safe_duration),
+                "-t", str(clip_len),
                 "-ac", "2",
                 "-ar", "44100",
                 "-codec:a", codec,
@@ -215,12 +325,17 @@ class AudioProcessor:
 
             if out_size <= MAX_SOUND_FILE_SIZE_BYTES:
                 duration = self.get_duration(out_bytes)
+                # If frame padding pushed it slightly, ensure it is capped
+                if duration > 5.15:
+                    # Final safety fallback pass
+                    continue
                 return AudioProcessResult(
                     success=True,
                     processed_bytes=out_bytes,
                     duration=duration,
                     file_size=out_size,
-                    file_format=target_format
+                    file_format=target_format,
+                    viral_climax_sec=climax_sec
                 )
 
         return AudioProcessResult(

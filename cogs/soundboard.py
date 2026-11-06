@@ -226,6 +226,8 @@ class SoundboardCog(commands.Cog, name="Soundboard Management"):
         )
         embed.add_field(name="Processed Duration", value=f"`{proc_result.duration}s`", inline=True)
         embed.add_field(name="Processed Size", value=f"`{proc_result.file_size // 1024} KB`", inline=True)
+        if proc_result.viral_climax_sec > 0:
+            embed.add_field(name="Viral Climax Detected", value=f"Peak at `{proc_result.viral_climax_sec}s`", inline=True)
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="delete_sound", description="Delete or manage unwanted sounds on your server's soundboard.")
