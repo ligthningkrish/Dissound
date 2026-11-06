@@ -5,6 +5,7 @@ Handles audio validation, trimming, format conversion, normalization, and size o
 import os
 import sys
 import shutil
+import tempfile
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +20,6 @@ from config import (
 )
 from core.logger import log
 
-# Ensure ffmpeg.exe exists in the binaries and Scripts folder for tools
 def _ensure_ffmpeg() -> str:
     exe = imageio_ffmpeg.get_ffmpeg_exe()
     dir_name = os.path.dirname(exe)
@@ -35,7 +35,6 @@ def _ensure_ffmpeg() -> str:
             shutil.copyfile(exe, scripts_shim)
         except Exception:
             pass
-    # Update PATH
     if dir_name not in os.environ.get("PATH", ""):
         os.environ["PATH"] = dir_name + os.pathsep + os.environ.get("PATH", "")
     return exe
@@ -67,38 +66,44 @@ class AudioProcessor:
 
     def get_duration(self, file_path_or_bytes: Path | bytes) -> float:
         """
-        Extract duration of an audio file in seconds using ffmpeg or fallback.
+        Extract duration of an audio file in seconds using ffmpeg.
         """
-        cmd = [self.ffmpeg]
-        if isinstance(file_path_or_bytes, bytes):
-            cmd.extend(["-i", "pipe:0"])
-            proc = subprocess.run(cmd, input=file_path_or_bytes, capture_output=True)
-            stderr = proc.stderr.decode("utf-8", errors="ignore")
-        else:
-            cmd.extend(["-i", str(file_path_or_bytes)])
+        temp_file = None
+        try:
+            if isinstance(file_path_or_bytes, bytes):
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                    f.write(file_path_or_bytes)
+                    target_path = f.name
+                    temp_file = target_path
+            else:
+                target_path = str(file_path_or_bytes)
+
+            cmd = [self.ffmpeg, "-i", target_path]
             proc = subprocess.run(cmd, capture_output=True)
             stderr = proc.stderr.decode("utf-8", errors="ignore")
 
-        # Parse duration from ffmpeg output: "Duration: 00:00:04.50,"
-        for line in stderr.splitlines():
-            line = line.strip()
-            if "Duration:" in line and "N/A" not in line:
+            for line in stderr.splitlines():
+                line = line.strip()
+                if "Duration:" in line and "N/A" not in line:
+                    try:
+                        dur_str = line.split("Duration:")[1].split(",")[0].strip()
+                        parts = dur_str.split(":")
+                        hours = float(parts[0])
+                        minutes = float(parts[1])
+                        seconds = float(parts[2])
+                        return round(hours * 3600 + minutes * 60 + seconds, 2)
+                    except Exception as e:
+                        log.warning(f"Failed to parse duration string '{line}': {e}")
+        finally:
+            if temp_file and os.path.exists(temp_file):
                 try:
-                    dur_str = line.split("Duration:")[1].split(",")[0].strip()
-                    parts = dur_str.split(":")
-                    hours = float(parts[0])
-                    minutes = float(parts[1])
-                    seconds = float(parts[2])
-                    return round(hours * 3600 + minutes * 60 + seconds, 2)
-                except Exception as e:
-                    log.warning(f"Failed to parse duration string '{line}': {e}")
+                    os.remove(temp_file)
+                except Exception:
+                    pass
 
-        # Fallback for piped mp3/raw bytes where header duration is N/A:
-        # Estimate via standard 128kbps bitrate or fallback duration calculation
         if isinstance(file_path_or_bytes, bytes) and len(file_path_or_bytes) > 0:
-            # size in bytes * 8 bits / (128000 bps)
             est = round(len(file_path_or_bytes) * 8 / 128000.0, 2)
-            return est
+            return min(5.2, est)
 
         return 0.0
 
@@ -168,12 +173,11 @@ class AudioProcessor:
         codec = "libmp3lame" if target_format == "mp3" else "libvorbis"
         fmt = "mp3" if target_format == "mp3" else "ogg"
 
-        # Multi-pass bitrate strategy to guarantee <= 512 KB
         bitrates = ["128k", "96k", "64k"]
 
         last_error = None
         for br in bitrates:
-            filters = []
+            filters = [f"atrim=0:{max_duration}", "asetpts=PTS-STARTPTS"]
             if normalize:
                 filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
 
@@ -181,20 +185,14 @@ class AudioProcessor:
                 self.ffmpeg,
                 "-y",
                 "-i", "pipe:0" if isinstance(input_data, bytes) else str(input_data),
-                "-t", str(max_duration),
-            ]
-
-            if filters:
-                cmd.extend(["-af", ",".join(filters)])
-
-            cmd.extend([
+                "-af", ",".join(filters),
                 "-ac", "2",
                 "-ar", "44100",
                 "-codec:a", codec,
                 "-b:a", br,
                 "-f", fmt,
                 "pipe:1"
-            ])
+            ]
 
             proc = subprocess.run(
                 cmd,
@@ -225,5 +223,4 @@ class AudioProcessor:
             error=last_error or "Processed audio exceeds 512 KB limit even after compression."
         )
 
-# Global singleton
 audio_processor = AudioProcessor()

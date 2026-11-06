@@ -321,3 +321,107 @@ class SoundboardDeleteConfirmView(discord.ui.View):
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Sound deletion canceled.", embed=None, view=None)
+
+
+class MemeCandidateHunterView(discord.ui.View):
+    """
+    Interactive carousel view that lets the user preview multiple real internet sound candidates
+    until they find the exact meme clip they want to add to their server soundboard.
+    """
+
+    def __init__(self, candidates: List[Sound], author_id: int, query: str, timeout: float = 300.0):
+        super().__init__(timeout=timeout)
+        self.candidates = candidates
+        self.author_id = author_id
+        self.query = query
+        self.current_index = 0
+        self._update_buttons()
+
+    def _update_buttons(self):
+        total = len(self.candidates)
+        # Prev button is index 0
+        self.prev_button.disabled = (self.current_index <= 0)
+        # Next button is index 3
+        self.next_button.disabled = (self.current_index >= total - 1)
+        self.counter_button.label = f"{self.current_index + 1} / {total}"
+
+    def build_embed(self) -> discord.Embed:
+        sound = self.candidates[self.current_index]
+        total = len(self.candidates)
+        embed = discord.Embed(
+            title=f"🌐 Internet Meme Scout: '{sound.sound_name}'",
+            description=(
+                f"**Search Query:** `{self.query}`\n"
+                f"**Candidate:** `{self.current_index + 1} of {total}`\n\n"
+                f"⏱️ **Duration:** `{sound.duration}s` (Auto-trimmed to Discord &le; 5.2s)\n"
+                f"📦 **File Size:** `{(sound.file_size // 1024)} KB` (Discord &le; 512 KB)\n"
+                f"🏷️ **Category:** `{sound.category}`\n"
+                f"🔗 **Source:** Real Web Audio Clip"
+            ),
+            color=EMBED_COLOR_DEFAULT
+        )
+        embed.set_footer(text="🎧 Click 'Preview Audio' to listen. Use ◀️ / ▶️ to browse other versions!")
+        return embed
+
+    @discord.ui.button(label="◀️ Previous", style=discord.ButtonStyle.secondary, row=0)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the search initiator can browse versions.", ephemeral=True)
+            return
+
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="1 / 1", style=discord.ButtonStyle.secondary, disabled=True, row=0)
+    async def counter_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pass
+
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.secondary, row=0)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the search initiator can browse versions.", ephemeral=True)
+            return
+
+        if self.current_index < len(self.candidates) - 1:
+            self.current_index += 1
+            self._update_buttons()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="🔊 Preview Audio", style=discord.ButtonStyle.primary, emoji="🎧", row=1)
+    async def preview_sound(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sound = self.candidates[self.current_index]
+        sound_path = Path(sound.file_path)
+
+        if not sound_path.exists():
+            await interaction.response.send_message("Audio file is missing from cache.", ephemeral=True)
+            return
+
+        file = discord.File(str(sound_path), filename=f"{sound.sound_id}.mp3")
+        embed = discord.Embed(
+            title=f"🔊 Playing Preview: {sound.sound_name}",
+            description=f"Candidate #{self.current_index + 1} ({sound.duration}s)\n*Listen in player above!*",
+            color=EMBED_COLOR_DEFAULT
+        )
+        await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+
+    @discord.ui.button(label="Add to Soundboard", style=discord.ButtonStyle.success, emoji="➕", row=1)
+    async def add_soundboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Must be used in a Discord server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        sound = self.candidates[self.current_index]
+        success, message = await upload_sound_to_guild(
+            guild=interaction.guild,
+            user=interaction.user,
+            sound=sound
+        )
+        embed = discord.Embed(
+            title="Soundboard Upload: Success!" if success else "Soundboard Upload Failed",
+            description=message,
+            color=EMBED_COLOR_SUCCESS if success else EMBED_COLOR_ERROR
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
